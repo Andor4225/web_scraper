@@ -107,7 +107,7 @@ CSV has one row per page (link lists are space-separated, with link counts), fol
 row per failed URL (with its `error`) and one per skipped URL (`error` is `skipped: <reason>`).
 
 > **Upgrading from 0.1:** `report.json` used to be a bare list of pages. It's now an object, and
-> the page list is under `"pages"`.
+> the page list is under `"pages"`. See the [CHANGELOG](CHANGELOG.md) for how to update scripts.
 
 ## Using it as a library
 
