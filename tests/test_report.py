@@ -1,6 +1,8 @@
 import csv
 import io
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -63,6 +65,7 @@ def test_render_csv(result: CrawlResult) -> None:
         "https://site.test",
         "https://site.test/b",
         "https://site.test/missing",
+        "https://site.test/private",
     ]
     assert rows[0]["heading"] == 'Quotes "and", commas'
     assert rows[0]["internal_link_count"] == "1"
@@ -70,6 +73,8 @@ def test_render_csv(result: CrawlResult) -> None:
     assert rows[1]["depth"] == "1"
     assert rows[2]["status_code"] == "404"
     assert rows[2]["error"] == "HTTP 404"
+    assert rows[3]["url"] == "https://site.test/private"
+    assert rows[3]["error"] == "skipped: disallowed by robots.txt"
 
 
 @pytest.mark.parametrize(
@@ -104,3 +109,20 @@ def test_write_report_failure_keeps_existing_file(
         write_report(result, out)
     assert out.read_text(encoding="utf-8") == "previous"
     assert list(tmp_path.iterdir()) == [out]
+
+
+def test_write_report_keeps_existing_file_mode(tmp_path: Path, result: CrawlResult) -> None:
+    out = tmp_path / "report.json"
+    out.write_text("old", encoding="utf-8")
+    out.chmod(0o600)
+    write_report(result, out)
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+
+
+def test_write_report_new_file_honours_umask(tmp_path: Path, result: CrawlResult) -> None:
+    old = os.umask(0o077)
+    try:
+        out = write_report(result, tmp_path / "report.json")
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600

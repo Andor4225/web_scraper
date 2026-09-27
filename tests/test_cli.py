@@ -139,3 +139,14 @@ def test_main_interrupted_still_writes_partial_report(
     out = tmp_path / "r.json"
     assert cli.main(["https://example.com", "-o", str(out), "-q"]) == cli.EXIT_INTERRUPTED
     assert json.loads(out.read_text())["summary"]["interrupted"] is True
+
+
+def test_int_options_share_parsing_rules() -> None:
+    _, config, *_ = cli.parse_args(["https://example.com", "--retries", "+2", "-c", "+2"])
+    assert (config.max_retries, config.max_concurrency) == (2, 2)
+
+
+def test_non_ascii_digits_rejected_with_clear_message(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        cli.parse_args(["https://example.com", "--retries", "\u00b2"])
+    assert "expected a whole number" in capsys.readouterr().err

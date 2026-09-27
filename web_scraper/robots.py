@@ -1,6 +1,7 @@
 """Per-origin robots.txt cache.
 
-Follows RFC 9309: 4xx means no restrictions, 5xx means disallow everything.
+Follows RFC 9309: 4xx means no restrictions; 5xx (and 429, like major crawlers)
+means disallow everything.
 """
 
 import asyncio
@@ -43,17 +44,19 @@ class RobotsCache:
         try:
             status, body = await self._fetch(robots_url)
         except Exception as exc:
-            # Network failure: the page request itself will fail and be reported
-            # with the real error, which is more useful than a robots.txt skip.
-            logger.warning("could not fetch %s (%s)", robots_url, exc)
+            # Network failure even after retries: the page requests will most likely
+            # fail too and be reported with the real error, which is more useful
+            # than reporting every page as disallowed by robots.txt.
+            logger.warning("could not fetch %s (%s); assuming no restrictions", robots_url, exc)
             return True
 
         if 200 <= status < 300:
             parser = RobotFileParser(robots_url)
             parser.parse(body.splitlines())
             return parser
-        if 400 <= status < 500:
+        if 400 <= status < 500 and status != 429:
             return True  # "unavailable": no restrictions
+        # 5xx and 429 (rate limited) mean "unreachable": disallow everything.
         logger.warning("%s returned HTTP %d; treating site as disallowed", robots_url, status)
         return False
 

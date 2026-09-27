@@ -174,3 +174,15 @@ def test_extract_page_data_splits_internal_and_external() -> None:
 
     strict = extract_page_data(html, BASE, ignore_www=False)
     assert strict["external_links"] == ["https://www.crawler-test.com/team", "https://example.org/"]
+
+
+def test_malformed_href_skips_only_that_link() -> None:
+    html = '<h1>Kept</h1><a href="http://[bad">bad</a><a href="/ok">ok</a>'
+    page = extract_page_data(html, BASE)
+    assert page["heading"] == "Kept"
+    assert page["outgoing_links"] == [f"{BASE}/ok"]
+
+
+def test_malformed_base_href_falls_back_to_page_url() -> None:
+    html = '<base href="http://[bad"><a href="ok">ok</a>'
+    assert get_urls_from_html(html, f"{BASE}/dir/") == [f"{BASE}/dir/ok"]

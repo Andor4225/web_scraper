@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import os
+import stat
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -89,7 +90,18 @@ def render_csv(result: CrawlResult) -> str:
                 "error": failure["error"],
             }
         )
+    for skipped in sorted(result.skipped, key=lambda s: s["url"]):
+        writer.writerow({"url": skipped["url"], "error": f"skipped: {skipped['reason']}"})
     return buffer.getvalue()
+
+
+def _target_mode(path: Path) -> int:
+    try:
+        return stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        umask = os.umask(0)
+        os.umask(umask)
+        return 0o666 & ~umask
 
 
 def write_report(
@@ -103,7 +115,8 @@ def write_report(
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(content)
-        os.chmod(tmp_name, 0o644)  # mkstemp creates 0600 files
+        # mkstemp creates 0600 files: keep an existing report's mode, else honour the umask.
+        os.chmod(tmp_name, _target_mode(path))
         os.replace(tmp_name, path)
     except BaseException:
         Path(tmp_name).unlink(missing_ok=True)

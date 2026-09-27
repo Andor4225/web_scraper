@@ -72,3 +72,15 @@ def test_is_same_site_strict_www() -> None:
 )
 def test_is_http_url(url: str, ok: bool) -> None:
     assert is_http_url(url) is ok
+
+
+def test_normalize_url_ignore_www() -> None:
+    assert normalize_url("https://www.example.com/a", ignore_www=True) == "example.com/a"
+    assert normalize_url("https://example.com/a", ignore_www=True) == "example.com/a"
+    assert normalize_url("https://www.example.com/a") == "www.example.com/a"
+
+
+def test_malformed_urls_never_raise() -> None:
+    assert is_http_url("http://[bad") is False
+    assert normalize_url("http://[bad") == "http://[bad"
+    assert site_key("http://[bad") == ""

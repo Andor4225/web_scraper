@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Self, TypedDict
@@ -23,6 +24,7 @@ REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 MAX_REDIRECTS = 10
 MAX_RETRY_AFTER = 60.0
+MAX_CRAWL_DELAY = 30.0
 ROBOTS_MAX_BYTES = 512 * 1024
 _CHUNK_SIZE = 64 * 1024
 
@@ -143,13 +145,18 @@ def decode_html(body: bytes, charset: str | None) -> str:
     return markup if markup is not None else body.decode("utf-8", errors="replace")
 
 
-async def _read_limited(response: aiohttp.ClientResponse, limit: int) -> bytes:
-    if response.content_length is not None and response.content_length > limit:
+async def _read_limited(
+    response: aiohttp.ClientResponse, limit: int, *, truncate: bool = False
+) -> bytes:
+    """Read at most ``limit`` bytes; raise if the body is larger, unless ``truncate``."""
+    if not truncate and response.content_length is not None and response.content_length > limit:
         raise ResponseTooLargeError(limit, response.status)
     body = bytearray()
     async for chunk in response.content.iter_chunked(_CHUNK_SIZE):
         body.extend(chunk)
         if len(body) > limit:
+            if truncate:
+                return bytes(body[:limit])
             raise ResponseTooLargeError(limit, response.status)
     return bytes(body)
 
@@ -170,6 +177,9 @@ class AsyncCrawler:
         if not is_http_url(base_url):
             raise ValueError(f"not an http(s) URL: {base_url!r}")
         self.base_url = base_url
+        # The site being crawled. Starts as the base URL and moves to wherever the
+        # start page finally lands if it redirects to another host (e.g. to www.).
+        self._site_url = base_url
         self.config = config or CrawlConfig()
         self._session = session
         self._owns_session = session is None
@@ -180,6 +190,7 @@ class AsyncCrawler:
         self._slots = asyncio.Condition()
         self._in_flight = 0
         self._stop = asyncio.Event()
+        self._running = False
 
         self._throttle_lock = asyncio.Lock()
         self._next_request_at = 0.0
@@ -213,13 +224,17 @@ class AsyncCrawler:
         return self._session
 
     def request_stop(self) -> None:
-        """Stop gracefully (e.g. on Ctrl+C); pages crawled so far are kept."""
-        if not self._stop.is_set():
+        """Stop gracefully (e.g. on Ctrl+C); pages crawled so far are kept.
+
+        Has no effect once the crawl has finished.
+        """
+        if self._running and not self._stop.is_set():
             self.result.interrupted = True
             self._stop.set()
 
     async def crawl(self) -> CrawlResult:
         started = time.monotonic()
+        self._running = True
         try:
             await self._configure_crawl_delay()
             self._enqueue(self.base_url, 0)
@@ -237,25 +252,38 @@ class AsyncCrawler:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
         finally:
+            self._running = False
             self.result.elapsed = time.monotonic() - started
         return self.result
 
     async def _configure_crawl_delay(self) -> None:
         if self._robots is None:
             return
-        crawl_delay = await self._robots.crawl_delay(self.base_url)
-        if crawl_delay is not None and crawl_delay > self._delay:
-            logger.info("using robots.txt crawl-delay of %.1fs", crawl_delay)
-            self._delay = crawl_delay
+        crawl_delay = await self._robots.crawl_delay(self._site_url)
+        if crawl_delay is None or crawl_delay <= self._delay:
+            return
+        if crawl_delay > MAX_CRAWL_DELAY:
+            logger.warning(
+                "robots.txt crawl-delay of %.0fs is unreasonable; using %.0fs",
+                crawl_delay,
+                MAX_CRAWL_DELAY,
+            )
+            crawl_delay = max(MAX_CRAWL_DELAY, self._delay)
+        logger.info("using robots.txt crawl-delay of %.1fs", crawl_delay)
+        self._delay = crawl_delay
+
+    def _key(self, url: str) -> str:
+        return normalize_url(url, ignore_www=self.config.ignore_www)
+
+    def _is_on_site(self, url: str) -> bool:
+        return is_same_site(url, self._site_url, ignore_www=self.config.ignore_www)
 
     def _enqueue(self, url: str, depth: int) -> None:
-        if not is_http_url(url) or not is_same_site(
-            url, self.base_url, ignore_www=self.config.ignore_www
-        ):
+        if not is_http_url(url) or not self._is_on_site(url):
             return
         if self.config.max_depth is not None and depth > self.config.max_depth:
             return
-        key = normalize_url(url)
+        key = self._key(url)
         if key in self._seen:
             return
         self._seen.add(key)
@@ -298,7 +326,7 @@ class AsyncCrawler:
 
     async def _visit(self, url: str, depth: int) -> None:
         try:
-            response = await self._fetch_page(url)
+            response = await self._fetch_page(url, is_start=depth == 0)
         except SkipURL as exc:
             logger.info("skipping %s: %s", url, exc)
             self.result.skipped.append({"url": url, "reason": str(exc)})
@@ -313,7 +341,13 @@ class AsyncCrawler:
             logger.debug("%s redirects to already-seen %s", url, exc)
             return
 
-        final_key = normalize_url(response.url)
+        if depth == 0 and not self._is_on_site(response.url):
+            # The start URL redirected to another host: crawl that site instead.
+            logger.info("start URL redirected to %s; crawling that site", response.url)
+            self._site_url = response.url
+            await self._configure_crawl_delay()
+
+        final_key = self._key(response.url)
         assert response.html is not None
         parsed = await asyncio.to_thread(
             extract_page_data, response.html, response.url, ignore_www=self.config.ignore_www
@@ -327,28 +361,32 @@ class AsyncCrawler:
         logger.warning("failed to crawl %s: %s", url, error)
         self.result.failures.append({"url": url, "status_code": status_code, "error": error})
 
-    async def _fetch_page(self, url: str) -> _Response:
+    async def _fetch_page(self, url: str, *, is_start: bool = False) -> _Response:
         """Fetch an HTML page, following same-site redirects one hop at a time.
 
         Redirect targets are claimed in ``_seen`` before they are requested, so a
         page reachable both directly and via a redirect is only downloaded once.
+        The start URL may redirect to another host (e.g. example.com -> www.example.com).
         """
         current = url
-        chain_keys = {normalize_url(url)}
+        chain_keys = {self._key(url)}
         for _ in range(MAX_REDIRECTS + 1):
             if self._robots is not None and not await self._robots.can_fetch(current):
                 raise SkipURL(f"disallowed by robots.txt: {current}")
-            response = await self._get(current)
+            response = await self._get(current, self._read_page)
             if response.status not in REDIRECT_STATUSES:
                 return response
             if not response.location:
                 raise RedirectError("redirect without a Location header", response.status)
-            target = strip_fragment(urljoin(current, response.location))
+            try:
+                target = strip_fragment(urljoin(current, response.location))
+            except ValueError:
+                target = response.location
             if not is_http_url(target):
                 raise RedirectError(f"redirect to unsupported URL {target}", response.status)
-            if not is_same_site(target, self.base_url, ignore_www=self.config.ignore_www):
+            if not is_start and not self._is_on_site(target):
                 raise SkipURL(f"redirects off-site to {target}")
-            key = normalize_url(target)
+            key = self._key(target)
             # Same key as an earlier hop (http -> https, /a -> /a/): keep following.
             if key not in chain_keys:
                 if key in self._seen:
@@ -358,8 +396,14 @@ class AsyncCrawler:
             current = target
         raise RedirectError(f"more than {MAX_REDIRECTS} redirects")
 
-    async def _get(self, url: str) -> _Response:
-        """GET one URL (no redirect following), retrying transient failures."""
+    async def _get[T](
+        self,
+        url: str,
+        read: Callable[[str, aiohttp.ClientResponse], Awaitable[T]],
+        *,
+        allow_redirects: bool = False,
+    ) -> T:
+        """GET one URL and pass the response to ``read``, retrying transient failures."""
         retries = self.config.max_retries
         for attempt in range(retries + 1):
             retry_after: str | None = None
@@ -368,12 +412,12 @@ class AsyncCrawler:
             try:
                 async with self.session.get(
                     url,
-                    allow_redirects=False,
+                    allow_redirects=allow_redirects,
                     headers={"User-Agent": self.config.user_agent},
                     timeout=aiohttp.ClientTimeout(total=self.config.timeout),
                 ) as response:
                     if response.status not in RETRYABLE_STATUSES or attempt == retries:
-                        return await self._read_page(url, response)
+                        return await read(url, response)
                     retry_after = response.headers.get("Retry-After")
                     reason = f"HTTP {response.status}"
             except (aiohttp.ClientError, TimeoutError) as exc:
@@ -415,18 +459,16 @@ class AsyncCrawler:
             await asyncio.sleep(wait)
 
     async def _fetch_text(self, url: str) -> tuple[int, str]:
-        """Fetch a small text resource such as robots.txt (redirects followed)."""
-        await self._throttle()
-        async with self.session.get(
-            url,
-            headers={"User-Agent": self.config.user_agent},
-            timeout=aiohttp.ClientTimeout(total=self.config.timeout),
-        ) as response:
-            if response.status >= 400:
-                return response.status, ""
-            body = await _read_limited(response, ROBOTS_MAX_BYTES)
-            # RFC 9309: robots.txt is UTF-8.
-            return response.status, body.decode("utf-8", errors="replace")
+        """Fetch robots.txt (redirects followed, transient failures retried)."""
+        return await self._get(url, self._read_text, allow_redirects=True)
+
+    @staticmethod
+    async def _read_text(url: str, response: aiohttp.ClientResponse) -> tuple[int, str]:
+        if response.status >= 400:
+            return response.status, ""
+        # RFC 9309: parse at least the first 500 KiB; the file is UTF-8.
+        body = await _read_limited(response, ROBOTS_MAX_BYTES, truncate=True)
+        return response.status, body.decode("utf-8", errors="replace")
 
 
 async def crawl_site(base_url: str, config: CrawlConfig | None = None) -> CrawlResult:

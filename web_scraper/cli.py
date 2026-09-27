@@ -6,7 +6,7 @@ import contextlib
 import logging
 import signal
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from .crawler import DEFAULT_USER_AGENT, AsyncCrawler, CrawlConfig, CrawlResult
@@ -20,20 +20,21 @@ EXIT_NO_PAGES = 1
 EXIT_INTERRUPTED = 130
 
 
-def _positive_int(value: str) -> int:
-    try:
-        number = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"expected a whole number, got {value!r}") from None
-    if number < 1:
-        raise argparse.ArgumentTypeError(f"must be at least 1, got {number}")
-    return number
+def _int_at_least(minimum: int) -> Callable[[str], int]:
+    def parse(value: str) -> int:
+        try:
+            number = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"expected a whole number, got {value!r}") from None
+        if number < minimum:
+            raise argparse.ArgumentTypeError(f"must be at least {minimum}, got {number}")
+        return number
+
+    return parse
 
 
-def _non_negative_int(value: str) -> int:
-    if value.isdigit():
-        return int(value)
-    raise argparse.ArgumentTypeError(f"expected a whole number >= 0, got {value!r}")
+_positive_int = _int_at_least(1)
+_non_negative_int = _int_at_least(0)
 
 
 def _non_negative_float(value: str) -> float:

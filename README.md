@@ -11,9 +11,10 @@ A concurrent, polite, domain-constrained web crawler built with Python, `asyncio
 - **Exact page limit**: `--max-pages` counts pages crawled successfully. Failed pages don't use
   up the budget.
 - **Stays on one site**: links are followed only on the start URL's host (the `www.` prefix is
-  ignored unless `--strict-host` is set). Redirects are followed one hop at a time, and
-  off-site redirects are skipped rather than fetched.
-- **Polite by default**: obeys `robots.txt` (including `Crawl-delay`), sends an identifying
+  ignored unless `--strict-host` is set). If the start URL redirects to another host (e.g.
+  `example.com` → `www.example.com`), that host becomes the site. Other redirects are followed
+  one hop at a time, and off-site redirects are skipped rather than fetched.
+- **Polite by default**: obeys `robots.txt` (including `Crawl-delay`, capped at 30s), sends an identifying
   `User-Agent`, and supports a fixed delay between requests.
 - **Resilient**: per-request timeouts, retries with exponential backoff for `429`/`5xx`/network
   errors (honouring `Retry-After`), a response size cap, and charset-safe decoding.
@@ -103,7 +104,7 @@ JSON (`report.json`):
 ```
 
 CSV has one row per page (link lists are space-separated, with link counts), followed by one
-row per failed URL with its `error`.
+row per failed URL (with its `error`) and one per skipped URL (`error` is `skipped: <reason>`).
 
 > **Upgrading from 0.1:** `report.json` used to be a bare list of pages. It's now an object, and
 > the page list is under `"pages"`.

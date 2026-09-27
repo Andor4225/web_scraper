@@ -41,7 +41,10 @@ def get_base_url(soup: BeautifulSoup, page_url: str) -> str:
     """Return the URL relative links resolve against, honouring ``<base href>``."""
     base = soup.find("base", href=True)
     if isinstance(base, Tag) and (href := _attr(base, "href")):
-        return urljoin(page_url, href)
+        try:
+            return urljoin(page_url, href)
+        except ValueError:
+            pass
     return page_url
 
 
@@ -55,7 +58,10 @@ def _resolve_all(soup: BeautifulSoup, page_url: str, tag_name: str, attr: str) -
         raw = _attr(tag, attr)
         if not raw:
             continue
-        url = strip_fragment(urljoin(base_url, raw))
+        try:
+            url = strip_fragment(urljoin(base_url, raw))
+        except ValueError:  # malformed href (e.g. "http://[bad"): skip just this link
+            continue
         # Drops mailto:, javascript:, tel:, data: and other non-HTTP targets.
         if not is_http_url(url) or url in seen:
             continue

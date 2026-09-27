@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from aiohttp import web
 
-from web_scraper.crawler import AsyncCrawler, CrawlConfig, CrawlResult, crawl_site
+from web_scraper.crawler import MAX_CRAWL_DELAY, AsyncCrawler, CrawlConfig, CrawlResult, crawl_site
 from web_scraper.urls import normalize_url
 
 Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
@@ -613,3 +613,94 @@ def test_crawl_config_validation(overrides: dict[str, Any]) -> None:
 def test_crawler_rejects_non_http_base_url(url: str) -> None:
     with pytest.raises(ValueError):
         AsyncCrawler(url)
+
+
+# Regression tests for review findings
+
+
+async def test_start_url_redirect_to_other_host_becomes_the_site(serve: ServeFn) -> None:
+    # Like example.com -> www.example.com: localhost redirects to 127.0.0.1.
+    async def root(request: web.Request) -> web.StreamResponse:
+        if request.host.startswith("localhost"):
+            return web.Response(status=301, headers={"Location": canonical})
+        return web.Response(text=html("/a", title="Home"), content_type="text/html")
+
+    site, canonical = await serve({"/": root, "/a": html(title="A")})
+    start = canonical.replace("127.0.0.1", "localhost")
+    result = await crawl(start)
+
+    assert result.skipped == []
+    assert {p["heading"] for p in result.pages.values()} == {"Home", "A"}
+    assert site.hits["/a"] == 1
+
+
+async def test_non_start_off_host_redirect_still_skipped(serve: ServeFn) -> None:
+    _, base = await serve({"/": html("/away"), "/away": redirect_to("http://localhost:1/x")})
+    result = await crawl(base)
+
+    assert [s["url"] for s in result.skipped] == [base.rstrip("/") + "/away"]
+
+
+def test_www_variants_share_one_dedup_key() -> None:
+    crawler = AsyncCrawler("https://example.com/", CrawlConfig())
+    crawler._enqueue("https://example.com/about", 1)
+    crawler._enqueue("https://www.example.com/about", 1)
+    assert crawler._queue.qsize() == 1
+
+
+async def test_malformed_redirect_location_is_a_failure(serve: ServeFn) -> None:
+    _, base = await serve(
+        {"/": html("/bad", "/ok"), "/bad": redirect_to("http://[oops"), "/ok": html()}
+    )
+    result = await crawl(base)
+
+    assert key(base, "/ok") in result.pages
+    assert [f["url"] for f in result.failures] == [base.rstrip("/") + "/bad"]
+
+
+async def test_huge_crawl_delay_is_capped(serve: ServeFn) -> None:
+    _, base = await serve({"/robots.txt": "User-agent: *\nCrawl-delay: 86400\n", "/": html()})
+    async with AsyncCrawler(base, fast_config(max_pages=1)) as crawler:
+        result = await asyncio.wait_for(crawler.crawl(), timeout=5)
+
+    assert len(result.pages) == 1
+    assert crawler._delay == MAX_CRAWL_DELAY
+
+
+async def test_robots_429_disallows_everything(serve: ServeFn) -> None:
+    async def limited(request: web.Request) -> web.StreamResponse:
+        return web.Response(status=429, headers={"Retry-After": "0"})
+
+    site, base = await serve({"/robots.txt": limited, "/": html()})
+    result = await crawl(base, max_retries=1)
+
+    assert result.pages == {}
+    assert [s["url"] for s in result.skipped] == [base]
+    assert site.hits["/robots.txt"] == 2  # retried once before giving up
+    assert site.hits["/"] == 0
+
+
+async def test_robots_transient_error_is_retried(serve: ServeFn) -> None:
+    robots = flaky(1)  # one 503, then the handler below takes over
+
+    async def robots_txt(request: web.Request) -> web.StreamResponse:
+        response = await robots(request)
+        if response.status == 200:
+            return web.Response(text="User-agent: *\nDisallow: /private\n")
+        return response
+
+    site, base = await serve({"/robots.txt": robots_txt, "/": html("/private"), "/private": html()})
+    result = await crawl(base)
+
+    assert site.hits["/robots.txt"] == 2
+    assert site.hits["/private"] == 0
+    assert [s["url"] for s in result.skipped] == [base.rstrip("/") + "/private"]
+
+
+async def test_request_stop_after_crawl_is_a_no_op(serve: ServeFn) -> None:
+    _, base = await serve({"/": html()})
+    async with AsyncCrawler(base, fast_config()) as crawler:
+        result = await crawler.crawl()
+        crawler.request_stop()  # e.g. Ctrl+C during session teardown
+
+    assert result.interrupted is False
